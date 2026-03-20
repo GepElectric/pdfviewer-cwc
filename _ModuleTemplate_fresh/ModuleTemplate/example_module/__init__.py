@@ -1,0 +1,1 @@
+"""Example Companion module package."""

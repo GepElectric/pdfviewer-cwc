@@ -1,0 +1,12 @@
+{
+  "id": "example_module",
+  "name": "Example Module",
+  "version": "0.1.0",
+  "entrypoint": "ExampleModule/ExampleModule.exe",
+  "working_dir": "ExampleModule",
+  "args": [],
+  "autostart_default": false,
+  "config_schema_path": "requirements.txt",
+  "log_path": "example_module.log",
+  "capabilities": ["open_pipe", "example_capability"]
+}

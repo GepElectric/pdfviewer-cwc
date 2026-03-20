@@ -1,0 +1,1726 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>MediaViewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./vendor/pdfjs/pdf.min.js"></script>
+  <script src="./js/webcc.min.js"></script>
+</head>
+<body>
+  <div id="appShell" class="app-shell mode-split">
+    <div class="toolbar">
+      <select id="folderSelect" class="toolbar-select" onchange="handleFolderChange(this.value)"></select>
+      <div class="zoom-group">
+        <button id="zoomSplit" class="toolbar-button active" type="button" onclick="setZoomMode('split')">Split</button>
+        <button id="zoomViewer" class="toolbar-button" type="button" onclick="setZoomMode('viewer')">Viewer</button>
+        <button id="zoomFullscreen" class="toolbar-button" type="button" onclick="setZoomMode('fullscreen')">Fullscreen</button>
+      </div>
+    </div>
+
+    <div id="contentShell" class="content-shell">
+      <aside id="browserPanel" class="browser-panel">
+        <div id="browserStatus" class="browser-status">Set `rootFolder` property.</div>
+        <div id="entryList" class="entry-list"></div>
+      </aside>
+      <section id="viewerPanel" class="viewer-panel">
+        <div class="viewer-shell">
+          <div id="pdfViewer" class="pdf-viewer">
+            <div class="pdf-toolbar">
+              <button id="pdfMenuToggle" class="pdf-button pdf-menu-button" type="button" title="Toggle navigation">&#9776;</button>
+              <button id="pdfPrevPage" class="pdf-button" type="button" title="Previous page">-</button>
+              <div class="pdf-pagebox">
+                <input id="pdfPageInput" class="pdf-page-input" type="text" inputmode="numeric" value="1">
+                <span id="pdfPageTotal" class="pdf-page-total">/ 0</span>
+              </div>
+              <button id="pdfNextPage" class="pdf-button" type="button" title="Next page">+</button>
+              <div class="pdf-divider"></div>
+              <button id="pdfZoomOut" class="pdf-button" type="button" title="Zoom out">-</button>
+              <button id="pdfZoomValue" class="pdf-button pdf-zoom-value" type="button" title="Fit width">100%</button>
+              <button id="pdfZoomIn" class="pdf-button" type="button" title="Zoom in">+</button>
+                <button id="pdfFitWidth" class="pdf-button" type="button" title="Fit width">Fit Width</button>
+                <button id="pdfFitPage" class="pdf-button" type="button" title="Fit page">Fit Page</button>
+                <div class="pdf-divider pdf-divider-spacer"></div>
+                <button id="pdfPrint" class="pdf-button pdf-download" type="button" title="Print PDF">&#128424;</button>
+              </div>
+            <div class="pdf-body">
+              <aside id="pdfSidebar" class="pdf-sidebar">
+                <div id="pdfOutlineTree" class="pdf-outline-root"></div>
+              </aside>
+              <div id="pdfViewport" class="pdf-viewport">
+                <div id="pdfPages" class="pdf-pages"></div>
+              </div>
+            </div>
+          </div>
+          <video id="videoViewer" class="viewer-frame" controls playsinline></video>
+          <audio id="audioViewer" class="audio-player" controls></audio>
+          <div id="imageWrap" class="image-wrap">
+            <img id="imageViewer" alt="Local media preview">
+          </div>
+          <iframe id="frameViewer" class="viewer-frame" title="Media frame"></iframe>
+
+          <div id="fallbackPanel" class="fallback-panel">
+            <div id="fallbackText" class="placeholder">Set `rootFolder` property.</div>
+            <a id="fallbackLink" class="open-link" href="#" target="_blank" rel="noopener noreferrer">Open Media</a>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    let currentMediaSource = "";
+    let currentMediaKind = "";
+    let refreshToken = 0;
+    let currentRootFolder = "";
+    let initialFolderName = "";
+    let folderOptions = [];
+    let selectedFolderPath = "";
+    let latestBrowseRequestId = 0;
+    let currentZoomMode = "split";
+    let currentLastPath = "";
+    let pendingRestoreRelativePath = "";
+    let currentSelectedEntryPath = "";
+    let currentFolderFiles = [];
+    let currentPlaybackPosition = 0;
+    let lastEmittedStateString = "";
+    let lastPlaybackSecond = -1;
+    let pendingPlaybackRestoreKind = "";
+    let lastPdfPageNumber = 0;
+    let currentPdfDocument = null;
+    let currentPdfPageNumber = 1;
+    let currentPdfPageCount = 0;
+    let currentPdfZoom = 1;
+    let currentPdfZoomMode = "fit-width";
+    let currentPdfRenderTask = null;
+    let currentPdfLoadToken = 0;
+    let currentPdfSourceForViewer = "";
+    let pdfSidebarOpen = true;
+    let pdfScrollTicking = false;
+    let pdfPageLabels = [];
+    let pdfOutlineTitlesByPage = {};
+    let pdfOutlineDestinations = {};
+    let pdfOutlineCounter = 0;
+    let pdfLayoutRefreshToken = 0;
+    let pdfScrollRequestToken = 0;
+
+    const LOCAL_MEDIA_SERVER = "http://127.0.0.1:8765/media?path=";
+    const LOCAL_BROWSE_SERVER = "http://127.0.0.1:8765/browse";
+    const VIDEO_EXTENSIONS = ["mp4", "webm", "ogg", "mov", "m4v", "mkv"];
+    const AUDIO_EXTENSIONS = ["mp3", "wav", "ogg", "aac", "m4a", "flac"];
+    const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "bmp", "webp", "svg"];
+    const PDF_MIN_ZOOM = 0.25;
+    const PDF_MAX_ZOOM = 4;
+
+    function buildStateString(kind, relativePath, position) {
+      const safeKind = String(kind || "").trim().toLowerCase();
+      const safePath = normalizeRelativePath(relativePath);
+      const safePosition = Number.isFinite(position) && position > 0 ? position : 0;
+      if (!safePath) {
+        return "";
+      }
+      return safeKind + "|" + safePath + "|" + safePosition;
+    }
+
+    function parseStateString(value) {
+      const rawValue = String(value || "").trim();
+      if (!rawValue) {
+        return { kind: "", relativePath: "", position: 0, isValid: false };
+      }
+
+      const segments = rawValue.split("|");
+      if (segments.length >= 2) {
+        const parsedKind = String(segments[0] || "").trim().toLowerCase();
+        const parsedRelativePath = normalizeRelativePath(segments[1]);
+        const parsedPosition = Number(segments[2]);
+
+        if (!parsedRelativePath) {
+          return { kind: "", relativePath: "", position: 0, isValid: false };
+        }
+
+        return {
+          kind: parsedKind,
+          relativePath: parsedRelativePath,
+          position: Number.isFinite(parsedPosition) && parsedPosition > 0 ? parsedPosition : 0,
+          isValid: true
+        };
+      }
+
+      const fallbackRelativePath = normalizeLastPathValue(rawValue);
+      return {
+        kind: "",
+        relativePath: fallbackRelativePath,
+        position: 0,
+        isValid: !!fallbackRelativePath
+      };
+    }
+
+    function emitSelectionState(positionOverride) {
+      const relativePath = normalizeRelativePath(currentLastPath);
+      if (!relativePath) {
+        return;
+      }
+
+      const stateString = buildStateString(
+        currentMediaKind,
+        relativePath,
+        Number.isFinite(positionOverride) ? positionOverride : currentPlaybackPosition
+      );
+
+      if (!stateString || stateString === lastEmittedStateString) {
+        return;
+      }
+
+      lastEmittedStateString = stateString;
+
+      try {
+        WebCC.Properties.last_path = stateString;
+      } catch (_error) {
+      }
+
+      try {
+        WebCC.Events.fire("documentSelected", stateString);
+      } catch (_error) {
+      }
+    }
+
+    function restoreMediaPlaybackPosition(mediaElement) {
+      if (!mediaElement || !Number.isFinite(currentPlaybackPosition) || currentPlaybackPosition <= 0) {
+        pendingPlaybackRestoreKind = "";
+        return;
+      }
+
+      const maxSafeTime = Number.isFinite(mediaElement.duration) && mediaElement.duration > 1
+        ? Math.max(0, mediaElement.duration - 1)
+        : currentPlaybackPosition;
+      mediaElement.currentTime = Math.min(currentPlaybackPosition, maxSafeTime);
+    }
+
+    function bindPlaybackStateEvents(elementId, kind) {
+      const mediaElement = document.getElementById(elementId);
+      if (!mediaElement) {
+        return;
+      }
+
+      mediaElement.addEventListener("loadedmetadata", function(event) {
+        if (currentMediaKind === kind && pendingPlaybackRestoreKind === kind) {
+          restoreMediaPlaybackPosition(event.currentTarget);
+        }
+      });
+
+      ["timeupdate", "pause", "seeked"].forEach(function(eventName) {
+        mediaElement.addEventListener(eventName, function(event) {
+          if (currentMediaKind !== kind) {
+            return;
+          }
+
+          if (pendingPlaybackRestoreKind === kind && event.currentTarget.currentTime < Math.max(0.5, currentPlaybackPosition - 0.25)) {
+            return;
+          }
+
+          if (pendingPlaybackRestoreKind === kind && (
+            eventName === "seeked" ||
+            event.currentTarget.currentTime >= Math.max(0, currentPlaybackPosition - 0.25)
+          )) {
+            pendingPlaybackRestoreKind = "";
+          }
+
+          const nextPosition = event.currentTarget.currentTime;
+          currentPlaybackPosition = Number.isFinite(nextPosition) && nextPosition > 0 ? nextPosition : 0;
+          const currentSecond = Math.floor(currentPlaybackPosition);
+
+          if (eventName !== "timeupdate" || currentSecond !== lastPlaybackSecond) {
+            lastPlaybackSecond = currentSecond;
+            emitSelectionState(currentPlaybackPosition);
+          }
+        });
+      });
+
+      mediaElement.addEventListener("ended", function() {
+        if (currentMediaKind !== kind) {
+          return;
+        }
+        currentPlaybackPosition = 0;
+        lastPlaybackSecond = -1;
+        emitSelectionState(0);
+      });
+    }
+
+    function normalizeSource(value) {
+      if (!value) {
+        return "";
+      }
+
+      const trimmedValue = String(value).trim();
+      if (!trimmedValue) {
+        return "";
+      }
+
+      if (/^https?:\/\//i.test(trimmedValue)) {
+        return trimmedValue;
+      }
+
+      if (/^file:\/\/\//i.test(trimmedValue)) {
+        const localPathFromFileUrl = decodeURIComponent(trimmedValue.replace(/^file:\/\/\//i, "")).replace(/\//g, "\\");
+        return LOCAL_MEDIA_SERVER + encodeURIComponent(localPathFromFileUrl);
+      }
+
+      if (/^[A-Za-z]:[\\/]/.test(trimmedValue)) {
+        return LOCAL_MEDIA_SERVER + encodeURIComponent(trimmedValue);
+      }
+
+      return "https://" + trimmedValue;
+    }
+
+    function escapeHtml(value) {
+      return String(value || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/\"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function normalizeRootFolder(value) {
+      const trimmedValue = String(value || "").trim();
+      if (!trimmedValue) {
+        return "";
+      }
+
+      if (/^file:\/\/\//i.test(trimmedValue)) {
+        return normalizeWindowsPath(decodeURIComponent(trimmedValue.replace(/^file:\/\/\//i, "")));
+      }
+
+      return normalizeWindowsPath(trimmedValue);
+    }
+
+    function normalizeWindowsPath(value) {
+      const rawValue = String(value || "").trim().replace(/\//g, "\\");
+      if (!rawValue) {
+        return "";
+      }
+
+      const driveMatch = rawValue.match(/^[A-Za-z]:\\/);
+      if (driveMatch) {
+        return driveMatch[0] + rawValue.substring(driveMatch[0].length).replace(/\\+/g, "\\").replace(/\\+$/g, "");
+      }
+
+      return rawValue.replace(/\\+/g, "\\").replace(/\\+$/g, "");
+    }
+
+    function normalizeRelativePath(value) {
+      return String(value || "")
+        .trim()
+        .replace(/\//g, "\\")
+        .replace(/^\\+/, "")
+        .replace(/\\+/g, "\\");
+    }
+
+    function normalizeLastPathValue(value) {
+      return String(value || "")
+        .trim()
+        .replace(/\//g, "\\")
+        .replace(/^\\+/, "")
+        .replace(/\\+/g, "\\");
+    }
+
+    function getRelativePathFromRoot(fullPath) {
+      const normalizedRoot = normalizeWindowsPath(currentRootFolder);
+      const normalizedFullPath = normalizeWindowsPath(fullPath);
+      if (!normalizedRoot || !normalizedFullPath) {
+        return "";
+      }
+
+      const rootWithSlash = normalizedRoot.endsWith("\\") ? normalizedRoot : normalizedRoot + "\\";
+      if (normalizedFullPath.toLowerCase().indexOf(rootWithSlash.toLowerCase()) !== 0) {
+        return "";
+      }
+
+      return normalizeRelativePath(normalizedFullPath.substring(rootWithSlash.length));
+    }
+
+    function getFolderPathFromRelativePath(relativePath) {
+      const normalizedRelative = normalizeRelativePath(relativePath);
+      if (!normalizedRelative) {
+        return "";
+      }
+
+      const lastSeparatorIndex = normalizedRelative.lastIndexOf("\\");
+      return lastSeparatorIndex >= 0 ? normalizedRelative.substring(0, lastSeparatorIndex) : "";
+    }
+
+    function getRootChildFolderFromRelativePath(relativePath) {
+      const normalizedRelative = normalizeRelativePath(relativePath);
+      if (!normalizedRelative) {
+        return "";
+      }
+
+      const firstSeparatorIndex = normalizedRelative.indexOf("\\");
+      return firstSeparatorIndex >= 0 ? normalizedRelative.substring(0, firstSeparatorIndex) : "";
+    }
+
+    function getLastPathParts(relativePath) {
+      const normalizedRelative = normalizeRelativePath(relativePath);
+      if (!normalizedRelative) {
+        return { folder: "", file: "" };
+      }
+
+      const segments = normalizedRelative.split("\\").filter(Boolean);
+      if (!segments.length) {
+        return { folder: "", file: "" };
+      }
+
+      return {
+        folder: segments.length > 1 ? segments[0] : "",
+        file: segments[segments.length - 1]
+      };
+    }
+
+    function getFullPathFromRoot(relativePath) {
+      const normalizedRelative = normalizeRelativePath(relativePath);
+      if (!currentRootFolder || !normalizedRelative) {
+        return "";
+      }
+
+      return normalizeWindowsPath(normalizeWindowsPath(currentRootFolder) + "\\" + normalizedRelative);
+    }
+
+    function persistLastPath(fullPath) {
+      const relativePath = getRelativePathFromRoot(fullPath);
+      currentLastPath = relativePath;
+      currentSelectedEntryPath = normalizeWindowsPath(fullPath);
+    }
+
+    function getFallbackFolderPath() {
+      if (!folderOptions.length) {
+        return "";
+      }
+
+      if (initialFolderName) {
+        const preferredFolder = folderOptions.find(function(folder) {
+          return folder.name.toLowerCase() === initialFolderName.toLowerCase();
+        });
+        if (preferredFolder) {
+          return preferredFolder.relativePath;
+        }
+      }
+
+      return folderOptions[0].relativePath;
+    }
+
+    function resolveRequestedFolderPath() {
+      const restoreFolderPath = getLastPathParts(currentLastPath).folder;
+      if (currentLastPath) {
+        if (!restoreFolderPath) {
+          return "";
+        }
+
+        const matchingRestoreFolder = folderOptions.find(function(folder) {
+          return normalizeRelativePath(folder.relativePath).toLowerCase() === restoreFolderPath.toLowerCase();
+        });
+        if (matchingRestoreFolder) {
+          return matchingRestoreFolder.relativePath;
+        }
+      }
+
+      return getFallbackFolderPath();
+    }
+
+    function restoreSelectionFromFiles(files) {
+      if (!currentLastPath) {
+        return false;
+      }
+
+      const normalizedRestorePath = normalizeRelativePath(currentLastPath);
+      const lastPathParts = getLastPathParts(normalizedRestorePath);
+      const matchingFile = (files || []).find(function(file) {
+        return String(file.name || "").toLowerCase() === lastPathParts.file.toLowerCase();
+      });
+
+      if (!matchingFile) {
+        return false;
+      }
+
+      currentLastPath = normalizedRestorePath;
+      currentSelectedEntryPath = normalizeWindowsPath(matchingFile.fullPath);
+      currentMediaKind = parseStateString(WebCC.Properties.last_path || "").kind || detectMediaKind(matchingFile.fullPath);
+      currentMediaSource = normalizeSource(matchingFile.fullPath);
+      currentPlaybackPosition = parseStateString(WebCC.Properties.last_path || "").position;
+      lastPdfPageNumber = currentMediaKind === "pdf" ? Math.floor(currentPlaybackPosition || 0) : 0;
+      currentPdfZoomMode = "fit-width";
+      lastPlaybackSecond = Math.floor(currentPlaybackPosition || 0);
+      renderEntryList(files || []);
+      renderViewer();
+      return true;
+    }
+
+    function getFileExtension(value) {
+      const source = String(value || "").trim();
+      if (!source) {
+        return "";
+      }
+
+      let candidate = source;
+      if (/^https?:\/\//i.test(candidate)) {
+        try {
+          candidate = new URL(candidate).pathname;
+        } catch (_error) {
+        }
+      }
+
+      if (/^file:\/\/\//i.test(candidate)) {
+        candidate = decodeURIComponent(candidate.replace(/^file:\/\/\//i, ""));
+      }
+
+      const cleanCandidate = candidate.split("?")[0].split("#")[0].replace(/\\/g, "/");
+      const lastPart = cleanCandidate.substring(cleanCandidate.lastIndexOf("/") + 1);
+      const dotIndex = lastPart.lastIndexOf(".");
+      return dotIndex >= 0 ? lastPart.substring(dotIndex + 1).toLowerCase() : "";
+    }
+
+    function detectMediaKind(rawValue) {
+      const extension = getFileExtension(rawValue);
+      if (extension === "pdf") {
+        return "pdf";
+      }
+      if (VIDEO_EXTENSIONS.indexOf(extension) >= 0) {
+        return "video";
+      }
+      if (AUDIO_EXTENSIONS.indexOf(extension) >= 0) {
+        return "audio";
+      }
+      if (IMAGE_EXTENSIONS.indexOf(extension) >= 0) {
+        return "image";
+      }
+      if (/^https?:\/\//i.test(String(rawValue || "").trim())) {
+        return "frame";
+      }
+      return "unknown";
+    }
+
+    function appendRefreshToken(url, token) {
+      const separator = url.indexOf("?") >= 0 ? "&" : "?";
+      return url + separator + "_cwc_refresh=" + token;
+    }
+
+    function clamp(value, min, max) {
+      return Math.min(max, Math.max(min, value));
+    }
+
+    function formatPdfZoomLabel(scale) {
+      return Math.round((scale || 1) * 100) + "%";
+    }
+
+    function getPdfViewportElement() {
+      return document.getElementById("pdfViewport");
+    }
+
+    function getPdfPagesElement() {
+      return document.getElementById("pdfPages");
+    }
+
+    function applyPdfSidebarState() {
+      pdfSidebarOpen = true;
+      const sidebar = document.getElementById("pdfSidebar");
+      if (sidebar) {
+        sidebar.classList.remove("collapsed");
+      }
+      const body = document.querySelector(".pdf-body");
+      if (body) {
+        body.classList.remove("sidebar-collapsed");
+      }
+      const menuToggle = document.getElementById("pdfMenuToggle");
+      if (menuToggle) {
+        menuToggle.classList.remove("active");
+      }
+      const viewport = getPdfViewportElement();
+      if (viewport) {
+        viewport.scrollLeft = 0;
+      }
+    }
+
+    function refreshPdfLayoutAtCurrentPage() {
+      if (currentMediaKind !== "pdf" || !currentPdfDocument) {
+        return;
+      }
+
+      const refreshToken = ++pdfLayoutRefreshToken;
+      const pageToKeep = currentPdfPageNumber;
+      window.requestAnimationFrame(function() {
+        if (refreshToken !== pdfLayoutRefreshToken) {
+          return;
+        }
+        window.requestAnimationFrame(function() {
+          if (refreshToken !== pdfLayoutRefreshToken) {
+            return;
+          }
+          setPdfPage(pageToKeep, { silent: true });
+        });
+      });
+    }
+
+    function isPdfRenderCancellation(error) {
+      const message = String((error && (error.message || error.name)) || "");
+      return message.indexOf("RenderingCancelled") >= 0 ||
+        message.indexOf("Rendering cancelled") >= 0 ||
+        message.indexOf("cancel") >= 0;
+    }
+
+    function inferPdfDestinationPageNumber(title) {
+      const match = String(title || "").trim().match(/^(\d{1,4})\b/);
+      if (!match) {
+        return 0;
+      }
+      const pageNumber = Number(match[1]);
+      return Number.isFinite(pageNumber) && pageNumber > 0 ? pageNumber : 0;
+    }
+
+    function updatePdfToolbar() {
+      document.getElementById("pdfPageInput").value = String(currentPdfPageNumber || 1);
+      document.getElementById("pdfPageTotal").textContent = "/ " + String(currentPdfPageCount || 0);
+      document.getElementById("pdfZoomValue").textContent = formatPdfZoomLabel(currentPdfZoom);
+      document.getElementById("pdfPrevPage").disabled = !currentPdfDocument || currentPdfPageNumber <= 1;
+      document.getElementById("pdfNextPage").disabled = !currentPdfDocument || currentPdfPageNumber >= currentPdfPageCount;
+      document.getElementById("pdfZoomOut").disabled = !currentPdfDocument;
+      document.getElementById("pdfZoomIn").disabled = !currentPdfDocument;
+      document.getElementById("pdfFitWidth").disabled = !currentPdfDocument;
+      document.getElementById("pdfFitPage").disabled = !currentPdfDocument;
+      document.getElementById("pdfPageInput").disabled = !currentPdfDocument;
+      document.getElementById("pdfPrint").disabled = !currentPdfSourceForViewer;
+      document.getElementById("pdfPrint").classList.toggle("disabled", !currentPdfSourceForViewer);
+    }
+
+    function updatePdfThumbSelection() {
+      const thumbButtons = document.querySelectorAll(".pdf-outline-link");
+      thumbButtons.forEach(function(button) {
+        const pageNumber = Number(button.getAttribute("data-page-number"));
+        button.classList.toggle("active", pageNumber === currentPdfPageNumber);
+      });
+    }
+
+    function emitPdfPageState(pageNumber) {
+      const nextPage = Math.max(1, Math.floor(Number(pageNumber) || 1));
+      if (nextPage === lastPdfPageNumber) {
+        return;
+      }
+      lastPdfPageNumber = nextPage;
+      currentPlaybackPosition = nextPage;
+      emitSelectionState(nextPage);
+      updatePdfThumbSelection();
+      updatePdfToolbar();
+    }
+
+    async function resolvePdfDestinationPageNumber(destination) {
+      if (!currentPdfDocument || !destination) {
+        return 0;
+      }
+
+      try {
+        const resolvedDestination = typeof destination === "string"
+          ? await currentPdfDocument.getDestination(destination)
+          : destination;
+        if (!resolvedDestination || !resolvedDestination.length) {
+          return 0;
+        }
+        const pageReference = resolvedDestination[0];
+        if (typeof pageReference === "number" && Number.isFinite(pageReference)) {
+          return pageReference + 1;
+        }
+        if (pageReference && typeof pageReference.num === "number") {
+          const pageIndex = await currentPdfDocument.getPageIndex(pageReference);
+          return pageIndex + 1;
+        }
+        if (pageReference && typeof pageReference.pageNumber === "number") {
+          return pageReference.pageNumber;
+        }
+        if (pageReference && typeof pageReference.ref === "object" && pageReference.ref) {
+          const pageIndex = await currentPdfDocument.getPageIndex(pageReference.ref);
+          return pageIndex + 1;
+        }
+        if (typeof pageReference === "string") {
+          const nestedDestination = await currentPdfDocument.getDestination(pageReference);
+          if (nestedDestination && nestedDestination.length) {
+            return resolvePdfDestinationPageNumber(nestedDestination);
+          }
+        }
+        return 0;
+      } catch (_error) {
+        return 0;
+      }
+    }
+
+    async function buildPdfOutlineNode(item) {
+      const resolvedPageNumber = await resolvePdfDestinationPageNumber(item.dest);
+      const pageNumber = resolvedPageNumber > 0 ? resolvedPageNumber : inferPdfDestinationPageNumber(item.title);
+      const childItems = Array.isArray(item.items) ? item.items : [];
+      let childrenHtml = "";
+      const outlineId = "outline-" + (++pdfOutlineCounter);
+
+      pdfOutlineDestinations[outlineId] = item.dest || "";
+
+      if (pageNumber > 0 && !pdfOutlineTitlesByPage[pageNumber]) {
+        pdfOutlineTitlesByPage[pageNumber] = String(item.title || "").trim();
+      }
+
+      for (let index = 0; index < childItems.length; index += 1) {
+        childrenHtml += await buildPdfOutlineNode(childItems[index]);
+      }
+
+      const label = escapeHtml(item.title || (pageNumber ? ("Page " + pageNumber) : "Untitled"));
+      const hasChildren = !!childrenHtml;
+      const rowAction = (pageNumber > 0 || item.dest)
+        ? ("<button type=\"button\" class=\"pdf-outline-link\" data-page-number=\"" + (pageNumber > 0 ? pageNumber : "") + "\" data-outline-id=\"" + outlineId + "\">" + label + "</button>")
+        : ("<div class=\"pdf-outline-label\">" + label + "</div>");
+
+      return "<div class=\"pdf-tree-node" + (hasChildren ? "" : " leaf") + "\">" +
+        "<div class=\"pdf-tree-row\">" +
+        (hasChildren
+          ? "<button type=\"button\" class=\"pdf-tree-toggle\" aria-expanded=\"false\">></button>"
+          : "<span class=\"pdf-tree-spacer\"></span>") +
+        rowAction +
+        "</div>" +
+        (hasChildren ? ("<div class=\"pdf-tree-children\">" + childrenHtml + "</div>") : "") +
+        "</div>";
+    }
+
+    async function renderPdfOutlineTree() {
+      const outlineTree = document.getElementById("pdfOutlineTree");
+      if (!outlineTree) {
+        return;
+      }
+
+      outlineTree.innerHTML = "<div class=\"pdf-nav-empty\">No entries</div>";
+      pdfOutlineTitlesByPage = {};
+      pdfOutlineDestinations = {};
+      pdfOutlineCounter = 0;
+      if (!currentPdfDocument) {
+        return;
+      }
+
+      try {
+        const outline = await currentPdfDocument.getOutline();
+        if (!outline || !outline.length) {
+          return;
+        }
+
+        let html = "";
+        for (let index = 0; index < outline.length; index += 1) {
+          html += await buildPdfOutlineNode(outline[index]);
+        }
+        outlineTree.innerHTML = html || "<div class=\"pdf-nav-empty\">No entries</div>";
+      } catch (_error) {
+      }
+    }
+
+    function ensureVisiblePdfNavigation(pageNumber) {
+      const selectors = [
+        ".pdf-outline-link[data-page-number=\"" + pageNumber + "\"]"
+      ];
+      selectors.forEach(function(selector) {
+        const node = document.querySelector(selector);
+        if (node) {
+          node.scrollIntoView({ block: "nearest" });
+        }
+      });
+    }
+
+    async function navigateToPdfOutlineButton(button) {
+      if (!button) {
+        return;
+      }
+
+      let pageNumber = Number(button.getAttribute("data-page-number"));
+      if (!(pageNumber > 0)) {
+        const outlineId = String(button.getAttribute("data-outline-id") || "");
+        const destination = pdfOutlineDestinations[outlineId];
+        pageNumber = await resolvePdfDestinationPageNumber(destination);
+        if (pageNumber > 0) {
+          button.setAttribute("data-page-number", String(pageNumber));
+        }
+      }
+
+      if (pageNumber > 0) {
+        setPdfPage(pageNumber);
+      }
+    }
+
+    async function computePdfScale(page) {
+      const viewportElement = getPdfViewportElement();
+      const baseViewport = page.getViewport({ scale: 1 });
+      const availableWidth = Math.max(240, viewportElement.clientWidth - 32);
+      const availableHeight = Math.max(240, viewportElement.clientHeight - 32);
+      const fitWidthScale = availableWidth / baseViewport.width;
+      const fitPageScale = Math.min(availableWidth / baseViewport.width, availableHeight / baseViewport.height);
+
+      if (currentPdfZoomMode === "fit-page") {
+        return clamp(fitPageScale, PDF_MIN_ZOOM, PDF_MAX_ZOOM);
+      }
+      if (currentPdfZoomMode === "fit-width") {
+        return clamp(fitWidthScale, PDF_MIN_ZOOM, PDF_MAX_ZOOM);
+      }
+      return clamp(currentPdfZoom, PDF_MIN_ZOOM, PDF_MAX_ZOOM);
+    }
+
+    async function createPdfAnnotationLayer(page, viewport, pageNumber) {
+      const layer = document.createElement("div");
+      layer.className = "pdf-annotation-layer";
+      layer.style.width = Math.round(viewport.width) + "px";
+      layer.style.height = Math.round(viewport.height) + "px";
+
+      let annotations = [];
+      try {
+        annotations = await page.getAnnotations();
+      } catch (_error) {
+        annotations = [];
+      }
+
+      for (let index = 0; index < annotations.length; index += 1) {
+        const annotation = annotations[index];
+        if (!annotation || annotation.subtype !== "Link" || !Array.isArray(annotation.rect)) {
+          continue;
+        }
+
+        const rectangle = viewport.convertToViewportRectangle(annotation.rect);
+        const left = Math.min(rectangle[0], rectangle[2]);
+        const top = Math.min(rectangle[1], rectangle[3]);
+        const width = Math.abs(rectangle[2] - rectangle[0]);
+        const height = Math.abs(rectangle[3] - rectangle[1]);
+
+        if (!(width > 0 && height > 0)) {
+          continue;
+        }
+
+        const hotspot = document.createElement("button");
+        hotspot.type = "button";
+        hotspot.className = "pdf-annotation-link";
+        hotspot.style.left = left + "px";
+        hotspot.style.top = top + "px";
+        hotspot.style.width = width + "px";
+        hotspot.style.height = height + "px";
+        hotspot.setAttribute("aria-label", annotation.contents || annotation.title || ("PDF link on page " + pageNumber));
+
+        if (annotation.url) {
+          hotspot.addEventListener("click", function() {
+            window.open(annotation.url, "_blank", "noopener,noreferrer");
+          });
+        } else if (annotation.dest || annotation.unsafeUrl) {
+          hotspot.addEventListener("click", async function() {
+            const destination = annotation.dest || annotation.unsafeUrl;
+            const targetPage = await resolvePdfDestinationPageNumber(destination);
+            if (targetPage > 0) {
+              setPdfPage(targetPage);
+            }
+          });
+        } else {
+          continue;
+        }
+
+        layer.appendChild(hotspot);
+      }
+
+      return layer;
+    }
+
+    function updatePdfPageFromScroll() {
+      const pagesElement = getPdfPagesElement();
+      const viewportElement = getPdfViewportElement();
+      if (!pagesElement || !viewportElement || currentMediaKind !== "pdf") {
+        return;
+      }
+
+      const pageNodes = Array.from(pagesElement.querySelectorAll(".pdf-page"));
+      if (!pageNodes.length) {
+        return;
+      }
+
+      const containerCenter = viewportElement.scrollTop + (viewportElement.clientHeight / 2);
+      let nextPageNumber = currentPdfPageNumber;
+      let bestDistance = Number.POSITIVE_INFINITY;
+
+      pageNodes.forEach(function(node) {
+        const pageNumber = Number(node.getAttribute("data-page-number"));
+        const pageCenter = node.offsetTop + (node.offsetHeight / 2);
+        const distance = Math.abs(pageCenter - containerCenter);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          nextPageNumber = pageNumber;
+        }
+      });
+
+      if (nextPageNumber !== currentPdfPageNumber) {
+        currentPdfPageNumber = nextPageNumber;
+        emitPdfPageState(nextPageNumber);
+      }
+    }
+
+    function handlePdfViewportScroll() {
+      if (pdfScrollTicking) {
+        return;
+      }
+
+      pdfScrollTicking = true;
+      window.requestAnimationFrame(function() {
+        pdfScrollTicking = false;
+        updatePdfPageFromScroll();
+      });
+    }
+
+    function getPdfTargetScrollTop(pageNumber) {
+      const viewport = getPdfViewportElement();
+      const target = document.querySelector(".pdf-page[data-page-number=\"" + pageNumber + "\"]");
+      if (!viewport || !target) {
+        return 0;
+      }
+
+      if (Number(pageNumber) <= 1) {
+        return 0;
+      }
+
+      const viewportRect = viewport.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      return Math.max(0, viewport.scrollTop + (targetRect.top - viewportRect.top) - 8);
+    }
+
+    function scrollPdfPageIntoView(pageNumber) {
+      const viewport = getPdfViewportElement();
+      if (!viewport) {
+        return;
+      }
+
+      const scrollToken = ++pdfScrollRequestToken;
+      function applyScroll(remainingFrames) {
+        if (scrollToken !== pdfScrollRequestToken) {
+          return;
+        }
+
+        viewport.scrollTop = getPdfTargetScrollTop(pageNumber);
+        viewport.scrollLeft = 0;
+
+        if (remainingFrames > 0) {
+          window.requestAnimationFrame(function() {
+            applyScroll(remainingFrames - 1);
+          });
+        }
+      }
+
+      applyScroll(3);
+    }
+
+    function createPdfPageNode(pageNumber, viewport, outputScale) {
+      const pageNode = document.createElement("div");
+      pageNode.className = "pdf-page";
+      pageNode.setAttribute("data-page-number", String(pageNumber));
+      pageNode.setAttribute("data-rendered", "false");
+
+      const canvas = document.createElement("canvas");
+      canvas.className = "pdf-canvas";
+      canvas.width = Math.max(1, Math.floor(viewport.width * outputScale));
+      canvas.height = Math.max(1, Math.floor(viewport.height * outputScale));
+      canvas.style.width = Math.round(viewport.width) + "px";
+      canvas.style.height = Math.round(viewport.height) + "px";
+
+      pageNode.appendChild(canvas);
+      return pageNode;
+    }
+
+    async function renderPdfPageIntoNode(page, pageNode, viewport, outputScale, renderToken, pageNumber) {
+      if (!pageNode || renderToken !== currentPdfLoadToken) {
+        return;
+      }
+
+      const canvas = pageNode.querySelector(".pdf-canvas");
+      if (!canvas) {
+        return;
+      }
+
+      canvas.width = Math.max(1, Math.floor(viewport.width * outputScale));
+      canvas.height = Math.max(1, Math.floor(viewport.height * outputScale));
+      canvas.style.width = Math.round(viewport.width) + "px";
+      canvas.style.height = Math.round(viewport.height) + "px";
+
+      const context = canvas.getContext("2d", { alpha: false });
+      context.setTransform(outputScale, 0, 0, outputScale, 0, 0);
+      currentPdfRenderTask = page.render({
+        canvasContext: context,
+        viewport: viewport
+      });
+      await currentPdfRenderTask.promise;
+
+      if (renderToken !== currentPdfLoadToken) {
+        return;
+      }
+
+      const previousLayer = pageNode.querySelector(".pdf-annotation-layer");
+      if (previousLayer) {
+        previousLayer.remove();
+      }
+
+      const annotationLayer = await createPdfAnnotationLayer(page, viewport, pageNumber);
+      if (annotationLayer.childElementCount) {
+        pageNode.appendChild(annotationLayer);
+      }
+      pageNode.setAttribute("data-rendered", "true");
+    }
+
+    async function ensureAllPdfPagesRendered() {
+      if (!currentPdfDocument) {
+        return false;
+      }
+
+      const pagesElement = getPdfPagesElement();
+      const pageNodes = Array.from(pagesElement.querySelectorAll(".pdf-page"));
+      if (!pageNodes.length) {
+        return false;
+      }
+
+      const renderToken = currentPdfLoadToken;
+      const outputScale = window.devicePixelRatio || 1;
+      for (let index = 0; index < pageNodes.length; index += 1) {
+        const pageNode = pageNodes[index];
+        if (pageNode.getAttribute("data-rendered") === "true") {
+          continue;
+        }
+
+        const pageNumber = Number(pageNode.getAttribute("data-page-number"));
+        if (!(pageNumber > 0)) {
+          continue;
+        }
+
+        const page = await currentPdfDocument.getPage(pageNumber);
+        if (renderToken !== currentPdfLoadToken) {
+          return false;
+        }
+
+        await renderPdfPageIntoNode(
+          page,
+          pageNode,
+          page.getViewport({ scale: currentPdfZoom }),
+          outputScale,
+          renderToken,
+          pageNumber
+        );
+      }
+
+      return renderToken === currentPdfLoadToken;
+    }
+
+    async function openPdfPrintDialog() {
+      if (!currentPdfDocument) {
+        return;
+      }
+
+      const isReady = await ensureAllPdfPagesRendered();
+      if (!isReady) {
+        return;
+      }
+
+      const canvasNodes = Array.from(document.querySelectorAll(".pdf-page .pdf-canvas"));
+      if (!canvasNodes.length) {
+        return;
+      }
+
+      const imageMarkup = canvasNodes.map(function(canvas, index) {
+        return "<img class=\"print-page\" src=\"" + canvas.toDataURL("image/png") + "\" alt=\"PDF page " + (index + 1) + "\">";
+      }).join("");
+
+      const printWindow = window.open("", "_blank", "width=1200,height=900");
+      if (!printWindow) {
+        return;
+      }
+
+      printWindow.document.open();
+      printWindow.document.write(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Print PDF</title>" +
+        "<style>" +
+        "html,body{margin:0;padding:0;background:#fff;font-family:Arial,sans-serif;}" +
+        ".print-page{display:block;width:100%;max-width:100%;page-break-after:always;break-after:page;}" +
+        ".print-page:last-child{page-break-after:auto;break-after:auto;}" +
+        "@page{margin:10mm;}" +
+        "@media print{html,body{margin:0;padding:0;}img{box-shadow:none;}}" +
+        "</style></head><body>" + imageMarkup + "</body></html>"
+      );
+      printWindow.document.close();
+      printWindow.focus();
+      printWindow.addEventListener("load", function() {
+        window.setTimeout(function() {
+          try {
+            printWindow.focus();
+            printWindow.print();
+          } catch (_error) {
+          }
+        }, 150);
+      }, { once: true });
+    }
+
+    async function renderAllPdfPages() {
+      if (!currentPdfDocument) {
+        return;
+      }
+
+      const renderToken = ++currentPdfLoadToken;
+      const viewportElement = getPdfViewportElement();
+      const pagesElement = getPdfPagesElement();
+      pagesElement.innerHTML = "";
+
+      if (currentPdfRenderTask) {
+        try {
+          currentPdfRenderTask.cancel();
+        } catch (_error) {
+        }
+        currentPdfRenderTask = null;
+      }
+
+      try {
+        const firstPage = await currentPdfDocument.getPage(1);
+        if (renderToken !== currentPdfLoadToken) {
+          return;
+        }
+
+        currentPdfZoom = await computePdfScale(firstPage);
+        const outputScale = window.devicePixelRatio || 1;
+        const templateViewport = firstPage.getViewport({ scale: currentPdfZoom });
+        const initialPageNumber = clamp(Math.floor(Number(currentPdfPageNumber) || 1), 1, currentPdfPageCount);
+
+        for (let pageNumber = 1; pageNumber <= currentPdfPageCount; pageNumber += 1) {
+          pagesElement.appendChild(createPdfPageNode(pageNumber, templateViewport, outputScale));
+        }
+
+        const initialPage = initialPageNumber === 1
+          ? firstPage
+          : await currentPdfDocument.getPage(initialPageNumber);
+        if (renderToken !== currentPdfLoadToken) {
+          return;
+        }
+
+        await renderPdfPageIntoNode(
+          initialPage,
+          pagesElement.querySelector(".pdf-page[data-page-number=\"" + initialPageNumber + "\"]"),
+          initialPage.getViewport({ scale: currentPdfZoom }),
+          outputScale,
+          renderToken,
+          initialPageNumber
+        );
+
+        if (renderToken !== currentPdfLoadToken) {
+          return;
+        }
+
+        viewportElement.scrollLeft = 0;
+        updatePdfToolbar();
+        ensureVisiblePdfNavigation(currentPdfPageNumber);
+
+        const remainingPageNumbers = [];
+        for (let pageNumber = 1; pageNumber <= currentPdfPageCount; pageNumber += 1) {
+          if (pageNumber !== initialPageNumber) {
+            remainingPageNumbers.push(pageNumber);
+          }
+        }
+
+        (async function renderRemainingPages() {
+          for (let index = 0; index < remainingPageNumbers.length; index += 1) {
+            const pageNumber = remainingPageNumbers[index];
+            if (renderToken !== currentPdfLoadToken) {
+              return;
+            }
+
+            const page = pageNumber === 1 ? firstPage : await currentPdfDocument.getPage(pageNumber);
+            if (renderToken !== currentPdfLoadToken) {
+              return;
+            }
+
+            await renderPdfPageIntoNode(
+              page,
+              pagesElement.querySelector(".pdf-page[data-page-number=\"" + pageNumber + "\"]"),
+              page.getViewport({ scale: currentPdfZoom }),
+              outputScale,
+              renderToken,
+              pageNumber
+            );
+          }
+        })();
+      } catch (_error) {
+        if (renderToken !== currentPdfLoadToken || isPdfRenderCancellation(_error)) {
+          return;
+        }
+        setFallback("PDF preview failed.", currentPdfSourceForViewer);
+      }
+    }
+
+    async function setPdfPage(pageNumber, options) {
+      const silent = options && options.silent;
+      const nextPageNumber = clamp(Math.floor(Number(pageNumber) || 1), 1, Math.max(1, currentPdfPageCount || 1));
+      currentPdfPageNumber = nextPageNumber;
+      scrollPdfPageIntoView(currentPdfPageNumber);
+      if (!silent) {
+        emitPdfPageState(currentPdfPageNumber);
+      } else {
+        lastPdfPageNumber = currentPdfPageNumber;
+        currentPlaybackPosition = currentPdfPageNumber;
+        updatePdfThumbSelection();
+        updatePdfToolbar();
+      }
+    }
+
+    async function loadPdfDocument(sourceUrl, restorePageNumber) {
+      if (!window.pdfjsLib) {
+        setFallback("PDF engine is not available.", sourceUrl);
+        return;
+      }
+
+      currentPdfSourceForViewer = sourceUrl;
+      const loadToken = ++currentPdfLoadToken;
+
+      if (currentPdfRenderTask) {
+        try {
+          currentPdfRenderTask.cancel();
+        } catch (_error) {
+        }
+        currentPdfRenderTask = null;
+      }
+
+      if (currentPdfDocument) {
+        try {
+          await currentPdfDocument.destroy();
+        } catch (_error) {
+        }
+        currentPdfDocument = null;
+      }
+
+      getPdfPagesElement().innerHTML = "";
+
+      try {
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = "./vendor/pdfjs/pdf.worker.min.js";
+        const loadingTask = window.pdfjsLib.getDocument({
+          url: sourceUrl,
+          withCredentials: false
+        });
+        const pdfDocument = await loadingTask.promise;
+        if (loadToken !== currentPdfLoadToken) {
+          try {
+            await pdfDocument.destroy();
+          } catch (_error) {
+          }
+          return;
+        }
+
+        currentPdfDocument = pdfDocument;
+        currentPdfPageCount = pdfDocument.numPages;
+        currentPdfPageNumber = clamp(Math.floor(Number(restorePageNumber) || 1), 1, currentPdfPageCount);
+        updatePdfToolbar();
+        renderPdfOutlineTree();
+        await renderAllPdfPages();
+        await setPdfPage(currentPdfPageNumber, { silent: true });
+      } catch (_error) {
+        if (loadToken !== currentPdfLoadToken || isPdfRenderCancellation(_error)) {
+          return;
+        }
+        setFallback("PDF preview failed.", sourceUrl);
+      }
+    }
+
+    function hideAllViewers() {
+      currentPdfLoadToken += 1;
+      const viewerIds = ["pdfViewer", "videoViewer", "audioViewer", "imageWrap", "frameViewer"];
+      viewerIds.forEach(function(id) {
+        const element = document.getElementById(id);
+        if (element) {
+          element.style.display = "none";
+        }
+      });
+
+      const videoViewer = document.getElementById("videoViewer");
+      const audioViewer = document.getElementById("audioViewer");
+      const imageViewer = document.getElementById("imageViewer");
+      const frameViewer = document.getElementById("frameViewer");
+
+      currentPdfSourceForViewer = "";
+      currentPdfDocument = null;
+      currentPdfPageCount = 0;
+      currentPdfPageNumber = 1;
+      document.getElementById("pdfOutlineTree").innerHTML = "<div class=\"pdf-nav-empty\">No entries</div>";
+      getPdfPagesElement().innerHTML = "";
+      videoViewer.pause();
+      videoViewer.removeAttribute("src");
+      videoViewer.load();
+      audioViewer.pause();
+      audioViewer.removeAttribute("src");
+      audioViewer.load();
+      imageViewer.removeAttribute("src");
+      frameViewer.removeAttribute("src");
+    }
+
+    function setFallback(message, href) {
+      const fallbackPanel = document.getElementById("fallbackPanel");
+      const fallbackText = document.getElementById("fallbackText");
+      const fallbackLink = document.getElementById("fallbackLink");
+
+      fallbackPanel.style.display = "flex";
+      fallbackText.textContent = message;
+      if (href) {
+        fallbackLink.href = href;
+        fallbackLink.style.display = "inline-flex";
+      } else {
+        fallbackLink.removeAttribute("href");
+        fallbackLink.style.display = "none";
+      }
+    }
+
+    function showViewer(id) {
+      document.getElementById("fallbackPanel").style.display = "none";
+      document.getElementById(id).style.display = id === "pdfViewer" ? "flex" : "block";
+    }
+
+    function renderViewer() {
+      hideAllViewers();
+
+      if (!currentMediaSource) {
+        setFallback("Select a file from the list.", "");
+        return;
+      }
+
+      refreshToken += 1;
+      const refreshedSource = appendRefreshToken(currentMediaSource, refreshToken);
+
+      if (currentMediaKind === "pdf") {
+        showViewer("pdfViewer");
+        applyPdfSidebarState();
+        updatePdfToolbar();
+        loadPdfDocument(refreshedSource, currentPlaybackPosition || 1);
+        return;
+      }
+
+      if (currentMediaKind === "video") {
+        pendingPlaybackRestoreKind = currentPlaybackPosition > 0 ? "video" : "";
+        document.getElementById("videoViewer").src = refreshedSource;
+        showViewer("videoViewer");
+        return;
+      }
+
+      if (currentMediaKind === "audio") {
+        pendingPlaybackRestoreKind = currentPlaybackPosition > 0 ? "audio" : "";
+        document.getElementById("audioViewer").src = refreshedSource;
+        showViewer("audioViewer");
+        return;
+      }
+
+      if (currentMediaKind === "image") {
+        document.getElementById("imageViewer").src = refreshedSource;
+        document.getElementById("imageWrap").style.display = "flex";
+        document.getElementById("fallbackPanel").style.display = "none";
+        return;
+      }
+
+      if (currentMediaKind === "frame") {
+        document.getElementById("frameViewer").src = refreshedSource;
+        showViewer("frameViewer");
+        return;
+      }
+
+      setFallback("This content type cannot be previewed directly. Open it via the link.", refreshedSource);
+    }
+
+    function updateSource(rawValue) {
+      const relativePath = getRelativePathFromRoot(rawValue);
+      currentMediaKind = detectMediaKind(rawValue);
+      currentMediaSource = normalizeSource(rawValue);
+      currentPlaybackPosition = 0;
+      lastPdfPageNumber = 0;
+      currentPdfZoomMode = "fit-width";
+      currentPdfZoom = 1;
+      lastPlaybackSecond = -1;
+      lastEmittedStateString = "";
+      persistLastPath(rawValue);
+      renderEntryList(currentFolderFiles);
+      emitSelectionState(0);
+      renderViewer();
+    }
+
+    function updateBrowserStatus(message) {
+      document.getElementById("browserStatus").textContent = message;
+    }
+
+    function renderFolderSelect() {
+      const select = document.getElementById("folderSelect");
+      if (!folderOptions.length) {
+        select.innerHTML = "";
+        const option = document.createElement("option");
+        option.value = "";
+        option.textContent = "No folders";
+        select.appendChild(option);
+        select.disabled = true;
+        return;
+      }
+
+      select.disabled = false;
+      select.innerHTML = folderOptions.map(function(folder) {
+        return "<option value=\"" + escapeHtml(folder.relativePath) + "\">" + escapeHtml(folder.name) + "</option>";
+      }).join("");
+      select.value = selectedFolderPath;
+    }
+
+    function renderEntryList(files) {
+      currentFolderFiles = files || [];
+      const entryList = document.getElementById("entryList");
+      if (!currentFolderFiles.length) {
+        entryList.innerHTML = "<div class=\"empty-state\">No files in selected folder.</div>";
+        return;
+      }
+
+      entryList.innerHTML = currentFolderFiles.map(function(file) {
+        const isActive = normalizeWindowsPath(file.fullPath).toLowerCase() === currentSelectedEntryPath.toLowerCase();
+        return "<button type=\"button\" class=\"entry-row file" + (isActive ? " active" : "") + "\" data-entry-path=\"" + escapeHtml(file.fullPath) + "\" title=\"" + escapeHtml(file.name) + "\">" +
+          "<span class=\"entry-icon\">&#128196;</span>" +
+          "<span class=\"entry-name\">" + escapeHtml(file.name) + "</span>" +
+          "</button>";
+      }).join("");
+    }
+
+    function updateZoomButtons() {
+      document.getElementById("zoomSplit").classList.toggle("active", currentZoomMode === "split");
+      document.getElementById("zoomViewer").classList.toggle("active", currentZoomMode === "viewer");
+      document.getElementById("zoomFullscreen").classList.toggle("active", currentZoomMode === "fullscreen");
+    }
+
+    async function setZoomMode(mode) {
+      currentZoomMode = mode;
+      const appShell = document.getElementById("appShell");
+      appShell.classList.remove("mode-split", "mode-viewer", "mode-fullscreen");
+      appShell.classList.add("mode-" + mode);
+      updateZoomButtons();
+
+      if (mode === "fullscreen") {
+        if (!document.fullscreenElement && appShell.requestFullscreen) {
+          try {
+            await appShell.requestFullscreen();
+          } catch (_error) {
+          }
+        }
+        return;
+      }
+
+      if (document.fullscreenElement && document.exitFullscreen) {
+        try {
+          await document.exitFullscreen();
+        } catch (_error) {
+        }
+      }
+    }
+
+    function buildFolderOptions(payload) {
+      return (payload.rootFolders || []).map(function(folder) {
+        return {
+          name: folder.name,
+          relativePath: folder.relativePath,
+          label: folder.name
+        };
+      });
+    }
+
+    async function browseTo(relativePath) {
+      if (!currentRootFolder) {
+        updateBrowserStatus("Set `rootFolder` property.");
+        folderOptions = [];
+        renderFolderSelect();
+        renderEntryList([]);
+        return;
+      }
+
+      const requestId = ++latestBrowseRequestId;
+      updateBrowserStatus("Loading...");
+
+      const url = LOCAL_BROWSE_SERVER +
+        "?root=" + encodeURIComponent(currentRootFolder) +
+        "&path=" + encodeURIComponent(relativePath || "");
+
+      try {
+        const response = await fetch(url, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error("Browse request failed with status " + response.status);
+        }
+
+        const payload = await response.json();
+        if (requestId !== latestBrowseRequestId) {
+          return;
+        }
+
+        folderOptions = buildFolderOptions(payload);
+        const currentRelativePath = normalizeRelativePath(payload.currentRelativePath || "");
+
+        if (!currentRelativePath) {
+          const requestedFolderPath = resolveRequestedFolderPath();
+          if (requestedFolderPath !== currentRelativePath) {
+            selectedFolderPath = requestedFolderPath;
+            renderFolderSelect();
+            browseTo(requestedFolderPath);
+            return;
+          }
+        }
+
+        selectedFolderPath = currentRelativePath;
+        renderFolderSelect();
+        renderEntryList(payload.files || []);
+        updateBrowserStatus((payload.files || []).length ? "" : "No files in folder");
+
+        if (currentLastPath) {
+          if (restoreSelectionFromFiles(payload.files || [])) {
+            return;
+          }
+
+          const fallbackFolderPath = getFallbackFolderPath();
+          const restoreFolderPath = getLastPathParts(currentLastPath).folder;
+          if (fallbackFolderPath && fallbackFolderPath !== selectedFolderPath && selectedFolderPath === restoreFolderPath) {
+            selectedFolderPath = fallbackFolderPath;
+            renderFolderSelect();
+            browseTo(fallbackFolderPath);
+          }
+        }
+      } catch (_error) {
+        const normalizedRelativePath = normalizeRelativePath(relativePath || "");
+        if (currentLastPath && normalizedRelativePath === getLastPathParts(currentLastPath).folder) {
+          selectedFolderPath = "";
+          browseTo("");
+          return;
+        }
+
+        updateBrowserStatus("Browse failed");
+        folderOptions = [];
+        renderFolderSelect();
+        renderEntryList([]);
+        setFallback("Folder browser is not available. Start the localhost media server.", "");
+      }
+    }
+
+    function handleFolderChange(relativePath) {
+      pendingRestoreRelativePath = "";
+      selectedFolderPath = relativePath || "";
+      browseTo(selectedFolderPath);
+    }
+
+    function handleRootFolderProperty(rawValue) {
+      const normalizedRoot = normalizeRootFolder(rawValue);
+      if (normalizedRoot === currentRootFolder) {
+        return;
+      }
+
+      currentRootFolder = normalizedRoot;
+      currentMediaSource = "";
+      currentMediaKind = "";
+      currentSelectedEntryPath = "";
+      currentFolderFiles = [];
+        renderViewer();
+
+      if (!currentRootFolder) {
+        updateBrowserStatus("Set `rootFolder` property.");
+        folderOptions = [];
+        renderFolderSelect();
+        renderEntryList([]);
+        return;
+      }
+
+      selectedFolderPath = "";
+      browseTo("");
+    }
+
+    function setProperty(data) {
+      if (data.key === "initialFolderName") {
+        initialFolderName = String(data.value || "").trim();
+        if (currentRootFolder) {
+          selectedFolderPath = "";
+          browseTo("");
+        }
+        return;
+      }
+
+      if (data.key === "last_path") {
+        const nextState = parseStateString(data.value);
+        const nextLastPath = nextState.isValid ? nextState.relativePath : "";
+        currentPlaybackPosition = nextState.position;
+        if (nextLastPath === currentLastPath) {
+          return;
+        }
+
+        currentLastPath = nextLastPath;
+        pendingRestoreRelativePath = nextLastPath;
+
+        if (currentRootFolder) {
+          selectedFolderPath = "";
+          browseTo("");
+        }
+        return;
+      }
+
+      if (data.key === "rootFolder") {
+        handleRootFolderProperty(data.value);
+      }
+    }
+
+    document.addEventListener("fullscreenchange", function() {
+      if (!document.fullscreenElement && currentZoomMode === "fullscreen") {
+        currentZoomMode = "viewer";
+        document.getElementById("appShell").classList.remove("mode-fullscreen");
+        document.getElementById("appShell").classList.add("mode-viewer");
+        updateZoomButtons();
+      }
+    });
+
+    document.getElementById("entryList").addEventListener("click", function(event) {
+      const button = event.target.closest(".entry-row");
+      if (!button) {
+        return;
+      }
+
+      const entryPath = button.getAttribute("data-entry-path") || "";
+      if (entryPath) {
+        updateSource(entryPath);
+      }
+    });
+
+    document.getElementById("pdfPrevPage").addEventListener("click", function() {
+      if (currentPdfDocument && currentPdfPageNumber > 1) {
+        setPdfPage(currentPdfPageNumber - 1);
+      }
+    });
+
+    document.getElementById("pdfNextPage").addEventListener("click", function() {
+      if (currentPdfDocument && currentPdfPageNumber < currentPdfPageCount) {
+        setPdfPage(currentPdfPageNumber + 1);
+      }
+    });
+
+    document.getElementById("pdfPageInput").addEventListener("change", function(event) {
+      if (currentPdfDocument) {
+        setPdfPage(event.currentTarget.value);
+      }
+    });
+
+    document.getElementById("pdfZoomIn").addEventListener("click", function() {
+      if (!currentPdfDocument) {
+        return;
+      }
+      currentPdfZoomMode = "custom";
+      currentPdfZoom = clamp(currentPdfZoom * 1.15, PDF_MIN_ZOOM, PDF_MAX_ZOOM);
+      renderAllPdfPages().then(function() {
+        setPdfPage(currentPdfPageNumber, { silent: true });
+      });
+    });
+
+    document.getElementById("pdfZoomOut").addEventListener("click", function() {
+      if (!currentPdfDocument) {
+        return;
+      }
+      currentPdfZoomMode = "custom";
+      currentPdfZoom = clamp(currentPdfZoom / 1.15, PDF_MIN_ZOOM, PDF_MAX_ZOOM);
+      renderAllPdfPages().then(function() {
+        setPdfPage(currentPdfPageNumber, { silent: true });
+      });
+    });
+
+    document.getElementById("pdfZoomValue").addEventListener("click", function() {
+      if (!currentPdfDocument) {
+        return;
+      }
+      currentPdfZoomMode = "fit-width";
+      renderAllPdfPages().then(function() {
+        setPdfPage(currentPdfPageNumber, { silent: true });
+      });
+    });
+
+    document.getElementById("pdfFitWidth").addEventListener("click", function() {
+      if (!currentPdfDocument) {
+        return;
+      }
+      currentPdfZoomMode = "fit-width";
+      renderAllPdfPages().then(function() {
+        setPdfPage(currentPdfPageNumber, { silent: true });
+      });
+    });
+
+    document.getElementById("pdfFitPage").addEventListener("click", function() {
+      if (!currentPdfDocument) {
+        return;
+      }
+      currentPdfZoomMode = "fit-page";
+      renderAllPdfPages().then(function() {
+        setPdfPage(currentPdfPageNumber, { silent: true });
+      });
+    });
+
+    document.getElementById("pdfPrint").addEventListener("click", function() {
+      openPdfPrintDialog();
+    });
+
+    document.getElementById("pdfOutlineTree").addEventListener("click", function(event) {
+      const toggle = event.target.closest(".pdf-tree-toggle");
+      if (toggle) {
+        const node = toggle.closest(".pdf-tree-node");
+        if (node) {
+          const isOpen = node.classList.toggle("open");
+          toggle.setAttribute("aria-expanded", isOpen ? "true" : "false");
+        }
+        return;
+      }
+
+      const button = event.target.closest(".pdf-outline-link");
+      if (!button) {
+        return;
+      }
+      navigateToPdfOutlineButton(button);
+    });
+
+    getPdfViewportElement().addEventListener("wheel", function(event) {
+      if (currentMediaKind !== "pdf" || !currentPdfDocument || !event.ctrlKey) {
+        return;
+      }
+      event.preventDefault();
+      currentPdfZoomMode = "custom";
+      currentPdfZoom = clamp(currentPdfZoom * (event.deltaY < 0 ? 1.1 : (1 / 1.1)), PDF_MIN_ZOOM, PDF_MAX_ZOOM);
+      renderAllPdfPages().then(function() {
+        setPdfPage(currentPdfPageNumber, { silent: true });
+      });
+    }, { passive: false });
+
+    getPdfViewportElement().addEventListener("scroll", handlePdfViewportScroll);
+
+    window.addEventListener("resize", function() {
+      if (currentMediaKind === "pdf" && currentPdfDocument && currentPdfZoomMode !== "custom") {
+        renderAllPdfPages().then(function() {
+          setPdfPage(currentPdfPageNumber, { silent: true });
+        });
+      }
+    });
+
+    bindPlaybackStateEvents("videoViewer", "video");
+    bindPlaybackStateEvents("audioViewer", "audio");
+
+    WebCC.start(
+      function(result) {
+        if (result) {
+          applyPdfSidebarState();
+          renderFolderSelect();
+          updateZoomButtons();
+          updatePdfToolbar();
+          initialFolderName = String(WebCC.Properties.initialFolderName || "").trim();
+          const initialState = parseStateString(WebCC.Properties.last_path || "");
+          currentLastPath = initialState.isValid ? initialState.relativePath : "";
+          currentPlaybackPosition = initialState.position;
+          pendingRestoreRelativePath = currentLastPath;
+          handleRootFolderProperty(WebCC.Properties.rootFolder);
+          WebCC.onPropertyChanged.subscribe(setProperty);
+        }
+      },
+      {
+        methods: {},
+        events: ["documentSelected"],
+        properties: {
+          "initialFolderName": "",
+          "last_path": "",
+          "rootFolder": ""
+        }
+      },
+      [],
+      10000
+    );
+  </script>
+</body>
+</html>

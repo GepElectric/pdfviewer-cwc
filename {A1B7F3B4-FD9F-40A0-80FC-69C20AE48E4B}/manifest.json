@@ -1,0 +1,46 @@
+{
+  "mver": "1.2.0",
+  "control": {
+    "identity": {
+      "name": "MediaViewer",
+      "version": "1.0",
+      "displayname": "MediaViewer",
+      "icon": "./assets/pdfViewer.ico",
+      "type": "guid://A1B7F3B4-FD9F-40A0-80FC-69C20AE48E4B",
+      "start": "./control/index.html"
+    },
+    "metadata": {
+      "author": "Codex",
+      "keywords": ["Media", "Viewer", "Document", "Video", "Audio", "Image"]
+    },
+    "contracts": {
+      "api": {
+        "methods": {},
+        "events": {
+          "documentSelected": {
+            "arguments": {
+              "currentPath": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "properties": {
+          "initialFolderName": {
+            "type": "string",
+            "default": ""
+          },
+          "last_path": {
+            "type": "string",
+            "default": ""
+          },
+          "rootFolder": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      }
+    },
+    "types": {}
+  }
+}

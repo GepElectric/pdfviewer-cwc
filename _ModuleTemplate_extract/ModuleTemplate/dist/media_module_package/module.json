@@ -1,0 +1,12 @@
+{
+  "id": "media_module",
+  "name": "Media Module",
+  "version": "0.2.0",
+  "entrypoint": "MediaModule/MediaModule.exe",
+  "working_dir": "MediaModule",
+  "args": [],
+  "autostart_default": false,
+  "config_schema_path": "requirements.txt",
+  "log_path": "media_module.log",
+  "capabilities": ["open_pipe", "media_pdf", "media_video", "media_audio", "media_image"]
+}
