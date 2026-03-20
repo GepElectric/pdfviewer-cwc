@@ -1,5 +1,8 @@
 # PdfViewer / MediaViewer CWC
 
+[![Repo](https://img.shields.io/badge/GitHub-pdfviewer--cwc-24292f?logo=github)](https://github.com/GepElectric/pdfviewer-cwc)
+[![Release](https://img.shields.io/github/v/release/GepElectric/pdfviewer-cwc)](https://github.com/GepElectric/pdfviewer-cwc/releases)
+
 `PdfViewer` is a WinCC Unified Custom Web Control that evolved into a media browser and viewer for PDFs, images, audio, and video, with a local helper backend.
 
 ## Repository Contents
